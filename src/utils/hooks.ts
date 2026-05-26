@@ -2940,6 +2940,8 @@ async function* executeHooks({
       yield {
         preventContinuation: true,
         stopReason: result.stopReason,
+        impossible: result.impossible,
+        hook: result.hook,
       }
     }
 
@@ -2947,11 +2949,12 @@ async function* executeHooks({
     if (result.blockingError) {
       yield {
         blockingError: result.blockingError,
+        hook: result.hook,
       }
     }
 
     if (result.message) {
-      yield { message: result.message }
+      yield { message: result.message, hook: result.hook }
     }
 
     // Yield system message separately if present
@@ -2964,6 +2967,7 @@ async function* executeHooks({
           toolUseID,
           hookEvent,
         }),
+        hook: result.hook,
       }
     }
 
@@ -2974,6 +2978,7 @@ async function* executeHooks({
       )
       yield {
         additionalContexts: [result.additionalContext],
+        hook: result.hook,
       }
     }
 
@@ -3878,6 +3883,12 @@ export async function* executeStopHooks(
       undefined
     : undefined
 
+  const backgroundTasks = toolUseContext
+    ? Object.values(toolUseContext.getAppState().tasks)
+        .map(t => `${t.id}: ${t.description} (${t.status})`)
+        .join('\n')
+    : undefined
+
   const hookInput: StopHookInput | SubagentStopHookInput = subagentId
     ? {
         ...createBaseHookInput(permissionMode),
@@ -3887,12 +3898,14 @@ export async function* executeStopHooks(
         agent_transcript_path: getAgentTranscriptPath(subagentId),
         agent_type: agentType ?? '',
         last_assistant_message: lastAssistantText,
+        background_tasks: backgroundTasks,
       }
     : {
         ...createBaseHookInput(permissionMode),
         hook_event_name: 'Stop',
         stop_hook_active: stopHookActive,
         last_assistant_message: lastAssistantText,
+        background_tasks: backgroundTasks,
       }
 
   // Trust check is now centralized in executeHooks()

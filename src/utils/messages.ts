@@ -5522,3 +5522,28 @@ export function wrapCommandText(
       return `The user sent a new message while you were working:\n${raw}\n\nIMPORTANT: After completing your current task, you MUST address the user's message above. Do not ignore it.`
   }
 }
+
+export function findGoalInHistory(messages: Message[]): {
+  condition: string
+  iterations: number
+  durationMs?: number
+  tokens?: number
+} | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    if (msg?.type !== 'attachment' || msg.attachment?.type !== 'goal_status') {
+      continue
+    }
+    const attachment = msg.attachment
+    if (!attachment.met || attachment.sentinel) {
+      continue
+    }
+    return {
+      condition: attachment.condition,
+      iterations: attachment.iterations,
+      durationMs: attachment.durationMs,
+      tokens: attachment.tokens,
+    }
+  }
+  return null
+}

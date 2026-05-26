@@ -264,6 +264,7 @@ export type HookResult = {
   outcome: 'success' | 'blocking' | 'non_blocking_error' | 'cancelled'
   preventContinuation?: boolean
   stopReason?: string
+  impossible?: boolean
   permissionBehavior?: 'ask' | 'deny' | 'allow' | 'passthrough'
   hookPermissionDecisionReason?: string
   additionalContext?: string
@@ -272,6 +273,7 @@ export type HookResult = {
   updatedMCPToolOutput?: unknown
   permissionRequestResult?: PermissionRequestResult
   retry?: boolean
+  hook: HookCommand
 }
 
 export type AggregatedHookResult = {
@@ -279,6 +281,7 @@ export type AggregatedHookResult = {
   blockingErrors?: HookBlockingError[]
   preventContinuation?: boolean
   stopReason?: string
+  impossible?: boolean
   hookPermissionDecisionReason?: string
   permissionBehavior?: PermissionResult['behavior']
   additionalContexts?: string[]
@@ -287,4 +290,5 @@ export type AggregatedHookResult = {
   updatedMCPToolOutput?: unknown
   permissionRequestResult?: PermissionRequestResult
   retry?: boolean
+  hook?: HookCommand
 }

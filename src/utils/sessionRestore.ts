@@ -92,6 +92,77 @@ function extractTodosFromTranscript(messages: Message[]): TodoList {
   return []
 }
 
+import { checkHasTrustDialogAccepted } from './config.js'
+import {
+  shouldAllowManagedHooksOnly,
+  shouldDisableAllHooksIncludingManaged,
+} from './hooks/hooksConfigSnapshot.js'
+import { addSessionHook } from './hooks/sessionHooks.js'
+import { countTokensWithAPI } from '../services/tokenEstimation.js'
+
+const TRUST_GATE_MSG =
+  '/goal is only available in trusted workspaces. Restart, accept the trust dialog, and try again.'
+const HOOKS_GATE_MSG =
+  "/goal can't run while hooks are disabled (disableAllHooks or allowManagedHooksOnly is set in settings or by policy)."
+
+export function checkGates(): string | null {
+  if (
+    shouldDisableAllHooksIncludingManaged() ||
+    shouldAllowManagedHooksOnly()
+  ) {
+    return HOOKS_GATE_MSG
+  }
+  if (!checkHasTrustDialogAccepted()) {
+    return TRUST_GATE_MSG
+  }
+  return null
+}
+
+export function findGoalToRestore(messages: Message[] | undefined): string | null {
+  if (!messages) return null
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    if (msg?.type !== 'attachment' || msg.attachment?.type !== 'goal_status') continue
+    const att = msg.attachment as any
+    if (att.met || att.failed) return null
+    return att.condition
+  }
+  return null
+}
+
+export async function restoreGoalFromTranscript(
+  messages: Message[] | undefined,
+  setAppState: (f: (prev: AppState) => AppState) => void,
+): Promise<void> {
+  const goal = findGoalToRestore(messages)
+  const gateError = goal !== null ? checkGates() : null
+
+  if (goal === null || gateError !== null) {
+    setAppState(prev => {
+      const { activeGoal, ...rest } = prev as any
+      return rest
+    })
+    return
+  }
+
+  const sessionId = getSessionId()
+  const hook = { type: 'prompt' as const, prompt: goal }
+  addSessionHook(setAppState, sessionId, 'Stop', '', hook)
+
+  const tokenUsage = await countTokensWithAPI('') // Hydrates token usage or fallback 0
+  setAppState(prev => ({
+    ...prev,
+    activeGoal: {
+      condition: goal,
+      iterations: 0,
+      setAt: Date.now(),
+      tokensAtStart: tokenUsage ?? 0,
+    },
+  } as any))
+
+  logForDebugging(`Hooks: goal restored on resume: ${goal}`)
+}
+
 /**
  * Restore session state (file history, attribution, todos) from log on resume.
  * Used by both SDK (print.ts) and interactive (REPL.tsx, main.tsx) resume paths.
@@ -147,6 +218,9 @@ export function restoreSessionStateFromLog(
       }))
     }
   }
+
+  // Restore active goal Stop hooks if the goal hasn't been met or failed yet
+  void restoreGoalFromTranscript(result.messages, setAppState)
 }
 
 /**

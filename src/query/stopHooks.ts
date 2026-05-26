@@ -6,7 +6,7 @@ import {
   logEvent,
 } from '../services/analytics/index.js'
 import type { ToolUseContext } from '../Tool.js'
-import type { HookProgress } from '../types/hooks.js'
+import type { HookProgress, PromptHook } from '../types/hooks.js'
 import type {
   AssistantMessage,
   Message,
@@ -37,6 +37,11 @@ import {
 import type { SystemPrompt } from '../utils/systemPromptType.js'
 import { getTaskListId, listTasks } from '../utils/tasks.js'
 import { getAgentName, getTeamName, isTeammate } from '../utils/teammate.js'
+import {
+  getTotalInputTokens,
+  getTotalOutputTokens,
+} from '../cost-tracker.js'
+import { createGoalAttachment } from '../commands/goal/utils.js'
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const extractMemoriesModule = feature('EXTRACT_MEMORIES')
@@ -175,6 +180,52 @@ export async function* handleStopHooks(
   try {
     const blockingErrors = []
     const appState = toolUseContext.getAppState()
+
+    // Defer goal evaluation if background work is running
+    let deferredGoalHook: PromptHook | null = null
+    const activeGoal = appState.activeGoal
+    if (activeGoal) {
+      const hasActiveTasks = Object.values(appState.tasks).some(
+        task =>
+          task.status !== 'completed' &&
+          task.status !== 'failed' &&
+          task.status !== 'killed',
+      )
+      if (hasActiveTasks) {
+        const sessionId = getSessionId()
+        const existingHooks = getSessionHooks(appState, sessionId, 'Stop').get(
+          'Stop',
+        )
+        if (existingHooks) {
+          for (const matcher of existingHooks) {
+            if (matcher.matcher === '') {
+              for (const hook of matcher.hooks) {
+                if (
+                  hook.type === 'prompt' &&
+                  hook.prompt === activeGoal.condition
+                ) {
+                  deferredGoalHook = hook
+                  removeSessionHook(
+                    toolUseContext.setAppStateForTasks ??
+                      toolUseContext.setAppState,
+                    sessionId,
+                    'Stop',
+                    '',
+                    hook,
+                  )
+                  logForDebugging(
+                    '[goal] evaluation deferred — background work still running',
+                  )
+                  break
+                }
+              }
+            }
+            if (deferredGoalHook) break
+          }
+        }
+      }
+    }
+
     const permissionMode = appState.toolPermissionContext.mode
 
     const generator = executeStopHooks(
@@ -238,6 +289,68 @@ export async function* handleStopHooks(
               ) {
                 hasOutput = true
               }
+
+              // Goal tracking logic
+              if (
+                attachment.hookEvent === 'Stop' &&
+                result.hook?.type === 'prompt'
+              ) {
+                const activeGoal = toolUseContext.getAppState().activeGoal
+                if (activeGoal && activeGoal.condition === result.hook.prompt) {
+                  const iterations = activeGoal.iterations + 1
+                  const durationMs = Date.now() - activeGoal.setAt
+                  const currentTokens =
+                    getTotalInputTokens() + getTotalOutputTokens()
+                  const tokens =
+                    currentTokens - (activeGoal.tokensAtStart ?? 0)
+
+                  // Clear active goal state
+                  toolUseContext.setAppState(prev => {
+                    const { activeGoal: _, ...rest } = prev as any
+                    return rest
+                  })
+
+                  yield { type: 'active_goal' as any, value: undefined }
+
+                  if (result.impossible) {
+                    yield createAttachmentMessage({
+                      type: 'goal_status' as any,
+                      met: false,
+                      failed: true,
+                      condition: result.hook.prompt,
+                      reason: result.stopReason,
+                      iterations,
+                      durationMs,
+                      tokens,
+                    })
+
+                    logEvent('tengu_goal_failed', {
+                      promptLength: result.hook.prompt.length,
+                      reasonLength: result.stopReason?.length ?? 0,
+                      iterations,
+                      durationMs,
+                      tokens,
+                    })
+                  } else {
+                    yield createAttachmentMessage({
+                      type: 'goal_status' as any,
+                      met: true,
+                      condition: result.hook.prompt,
+                      reason: result.stopReason,
+                      iterations,
+                      durationMs,
+                      tokens,
+                    })
+
+                    logEvent('tengu_goal_achieved', {
+                      promptLength: result.hook.prompt.length,
+                      iterations,
+                      durationMs,
+                      tokens,
+                    })
+                  }
+                }
+              }
             }
             // Extract per-hook duration for timing visibility.
             // Hooks run in parallel; match by command + first unassigned entry.
@@ -262,8 +375,37 @@ export async function* handleStopHooks(
         blockingErrors.push(userMessage)
         yield userMessage
         hasOutput = true
-        // Add to hookErrors so it appears in the summary
-        hookErrors.push(result.blockingError.blockingError)
+
+        // Goal tracking logic for blocking error
+        if (result.hook?.type === 'prompt') {
+          const activeGoal = toolUseContext.getAppState().activeGoal
+          if (activeGoal && activeGoal.condition === result.hook.prompt) {
+            const iterations = activeGoal.iterations + 1
+            const nextGoal = {
+              ...activeGoal,
+              iterations,
+              lastReason: result.stopReason,
+            }
+            toolUseContext.setAppState(prev => ({
+              ...prev,
+              activeGoal: nextGoal,
+            }))
+
+            yield { type: 'active_goal' as any, value: nextGoal }
+            yield createAttachmentMessage({
+              type: 'goal_status' as any,
+              met: false,
+              condition: result.hook.prompt,
+              reason: result.stopReason,
+            })
+          } else {
+            // Add to hookErrors only if it's not our tracked goal (or if no goal active)
+            hookErrors.push(result.blockingError.blockingError)
+          }
+        } else {
+          // Add to hookErrors so it appears in the summary
+          hookErrors.push(result.blockingError.blockingError)
+        }
       }
       // Check if hook wants to prevent continuation
       if (result.preventContinuation) {
@@ -452,8 +594,8 @@ export async function* handleStopHooks(
       }
     }
 
-    return { blockingErrors: [], preventContinuation: false }
-  } catch (error) {
+    return { blockingErrors, preventContinuation: preventedContinuation }
+    } catch (error) {
     const durationMs = Date.now() - hookStartTime
     logEvent('tengu_stop_hook_error', {
       duration: durationMs,
@@ -469,5 +611,16 @@ export async function* handleStopHooks(
       'warning',
     )
     return { blockingErrors: [], preventContinuation: false }
-  }
-}
+    } finally {
+    if (deferredGoalHook) {
+      addSessionHook(
+        toolUseContext.setAppStateForTasks ?? toolUseContext.setAppState,
+        getSessionId(),
+        'Stop',
+        '',
+        deferredGoalHook,
+      )
+    }
+    }
+    }
+
